@@ -1,0 +1,23 @@
+# Source documents may be licensed, operator-specific, or otherwise private.
+# Keep the directory structure in Git, but never commit the document files.
+sources/incoming/**
+sources/documents/**
+
+!sources/incoming/**/
+!sources/incoming/**/.gitkeep
+!sources/documents/**/
+!sources/documents/**/.gitkeep
+
+# Local pipeline state and Python build artifacts
+data/*.db
+data/*.db-*
+data/*.sqlite
+data/*.sqlite-*
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+dist/
+build/
+tmp/

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aircraft-knowledge-pipeline"
+version = "0.1.0"
+description = "Source-grounded aircraft document processing and OKF knowledge pipeline"
+requires-python = ">=3.12"
+dependencies = [
+    "pypdf>=6,<7",
+]
+
+[project.scripts]
+akp = "aircraft_knowledge_pipeline.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+aircraft_knowledge_pipeline = ["schema.sql"]
