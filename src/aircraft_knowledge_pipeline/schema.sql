@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS schema_metadata (
 );
 
 INSERT INTO schema_metadata (key, value)
-VALUES ('schema_version', '1')
+VALUES ('schema_version', '4')
 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -195,6 +195,35 @@ CREATE TABLE IF NOT EXISTS topic_evidence (
 CREATE INDEX IF NOT EXISTS idx_topic_evidence_chunk
 ON topic_evidence(chunk_id);
 
+CREATE TABLE IF NOT EXISTS evidence_reviews (
+    topic_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    evidence_role TEXT NOT NULL,
+    classification TEXT NOT NULL
+        CHECK(classification IN (
+            'procedure_candidate',
+            'supporting_reference',
+            'incidental',
+            'manual_review'
+        )),
+    score REAL NOT NULL,
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    processor_version TEXT NOT NULL,
+    review_status TEXT NOT NULL DEFAULT 'needs_review'
+        CHECK(review_status IN ('needs_review', 'approved', 'rejected')),
+    reviewer TEXT,
+    reviewed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(topic_id, chunk_id, evidence_role),
+    FOREIGN KEY(topic_id, chunk_id, evidence_role)
+        REFERENCES topic_evidence(topic_id, chunk_id, evidence_role)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_evidence_reviews_queue
+ON evidence_reviews(review_status, classification, score DESC);
+
 CREATE TABLE IF NOT EXISTS claims (
     id TEXT PRIMARY KEY,
     topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
@@ -214,6 +243,26 @@ CREATE TABLE IF NOT EXISTS claim_evidence (
     created_at TEXT NOT NULL,
     PRIMARY KEY(claim_id, chunk_id)
 );
+
+CREATE TABLE IF NOT EXISTS claim_metadata (
+    claim_id TEXT PRIMARY KEY REFERENCES claims(id) ON DELETE CASCADE,
+    section_key TEXT NOT NULL
+        CHECK(section_key IN (
+            'overview',
+            'system_flow',
+            'components',
+            'control_logic',
+            'maintenance_context',
+            'applicability'
+        )),
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    applicability TEXT,
+    reviewer TEXT,
+    reviewed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_claim_metadata_section
+ON claim_metadata(section_key, sort_order);
 
 CREATE TABLE IF NOT EXISTS source_conflicts (
     id TEXT PRIMARY KEY,
@@ -264,3 +313,10 @@ CREATE TABLE IF NOT EXISTS artifacts (
     UNIQUE(artifact_type, artifact_path, content_hash)
 );
 
+CREATE TABLE IF NOT EXISTS artifact_reviews (
+    artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
+    review_status TEXT NOT NULL
+        CHECK(review_status IN ('approved', 'rejected')),
+    reviewer TEXT NOT NULL,
+    reviewed_at TEXT NOT NULL
+);

@@ -29,6 +29,26 @@ from aircraft_knowledge_pipeline.topic_discovery import (
     candidate_from_section,
     discover_topic_candidates,
 )
+from aircraft_knowledge_pipeline.topic_canonicalization import (
+    ata_from_hierarchy,
+    promote_topic_candidates,
+)
+from aircraft_knowledge_pipeline.topic_enrichment import (
+    DEFAULT_ENRICHMENT_TYPES,
+    enrich_topics,
+)
+from aircraft_knowledge_pipeline.evidence_review import (
+    classify_evidence,
+    triage_evidence,
+)
+from aircraft_knowledge_pipeline.editorial_draft import build_editorial_draft
+from aircraft_knowledge_pipeline.okf_preview import build_okf_preview
+from aircraft_knowledge_pipeline.research_packet import build_research_packet
+from aircraft_knowledge_pipeline.source_policy import (
+    CORE_SOURCE_TYPES,
+    DEFAULT_EXCLUDED_SOURCE_TYPES,
+    OPTIONAL_SOURCE_TYPES,
+)
 
 
 def write_text_pdf(path: Path, pages: list[str], outline_items: int = 0) -> None:
@@ -105,7 +125,7 @@ class KnowledgeStoreTests(unittest.TestCase):
         )
 
     def test_initializes_schema_and_fts5(self) -> None:
-        self.assertEqual(self.store.schema_version(), "1")
+        self.assertEqual(self.store.schema_version(), "4")
         tables = {
             row["name"]
             for row in self.store.connection.execute(
@@ -116,6 +136,7 @@ class KnowledgeStoreTests(unittest.TestCase):
         self.assertIn("source_chunks", tables)
         self.assertIn("source_chunks_fts", tables)
         self.assertIn("processing_jobs", tables)
+        self.assertIn("evidence_reviews", tables)
 
     def test_indexes_and_filters_page_aware_chunks(self) -> None:
         mel_version = self.register_source(
@@ -292,7 +313,7 @@ class CliTests(unittest.TestCase):
                     0,
                 )
             rendered = output.getvalue()
-            self.assertIn("schema version 1", rendered)
+            self.assertIn("schema version 4", rendered)
             self.assertIn('"documents": 0', rendered)
 
     def test_refuses_missing_database_for_non_init_command(self) -> None:
@@ -533,6 +554,555 @@ class TopicDiscoveryTests(unittest.TestCase):
                 [tuple(row) for row in rows],
                 [("Recirculation System", 0.98, "candidate")],
             )
+
+
+class TopicWorkflowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.database_path = Path(self.temporary_directory.name) / "pipeline.db"
+        self.store = KnowledgeStore(self.database_path)
+        self.store.initialize()
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self.temporary_directory.cleanup()
+
+    def register_version(self, document_id: str, document_type: str) -> str:
+        self.store.register_document(
+            document_id=document_id,
+            file_name=f"{document_id}.pdf",
+            title=document_id,
+            document_type=document_type,
+        )
+        return self.store.register_document_version(
+            document_id=document_id,
+            checksum=f"{document_id}-checksum",
+            status="current",
+        )
+
+    def test_condensed_source_policy_defaults(self) -> None:
+        self.assertEqual(CORE_SOURCE_TYPES, ("training", "amm"))
+        self.assertEqual(DEFAULT_ENRICHMENT_TYPES, CORE_SOURCE_TYPES)
+        self.assertEqual(OPTIONAL_SOURCE_TYPES, ("mel", "qrh"))
+        self.assertEqual(DEFAULT_EXCLUDED_SOURCE_TYPES, ("fcom",))
+
+    def test_promotes_candidate_with_stable_topic_alias_and_ata(self) -> None:
+        version_id = self.register_version("training-21", "training")
+        self.store.add_section(
+            version_id=version_id,
+            title="Subject 21-25-00 - Recirculation System",
+            hierarchy_path=(
+                "Chapter 21 - Air Conditioning > "
+                "Subject 21-25-00 - Recirculation System"
+            ),
+            ordinal=1,
+        )
+        discover_topic_candidates(self.store)
+
+        promoted = promote_topic_candidates(
+            self.store,
+            aircraft="737 NG",
+            accept_all=True,
+        )
+        topic = self.store.connection.execute(
+            "SELECT id, slug, title, aircraft, ata_json FROM topics"
+        ).fetchone()
+        candidate = self.store.connection.execute(
+            "SELECT status, proposed_topic_id FROM topic_candidates"
+        ).fetchone()
+
+        self.assertEqual(len(promoted), 1)
+        self.assertEqual(
+            tuple(topic),
+            (
+                "737ng-recirculation-system",
+                "recirculation-system",
+                "Recirculation System",
+                "737 NG",
+                '["21"]',
+            ),
+        )
+        self.assertEqual(
+            tuple(candidate),
+            ("accepted", "737ng-recirculation-system"),
+        )
+        self.assertEqual(
+            self.store.aliases_for_topic("737ng-recirculation-system"),
+            ["Recirculation System"],
+        )
+        self.assertEqual(
+            ata_from_hierarchy("Chapter 21 > Subject 21-25-00"),
+            ("21",),
+        )
+
+    def test_enrichment_records_found_not_found_evidence_and_skips(self) -> None:
+        mel_version = self.register_version("operator-mel", "mel")
+        qrh_version = self.register_version("operator-qrh", "qrh")
+        mel_section = self.store.add_section(
+            version_id=mel_version,
+            title="Recirculation System",
+            hierarchy_path="MEL > ATA 21 > Recirculation System",
+            ordinal=1,
+        )
+        self.store.add_chunk(
+            version_id=mel_version,
+            section_id=mel_section,
+            ordinal=1,
+            heading="Recirculation System",
+            hierarchy_path="MEL > ATA 21 > Recirculation System",
+            content="The recirculation system may be inoperative for dispatch.",
+            pdf_pages=[12],
+        )
+        self.store.add_section(
+            version_id=qrh_version,
+            title="Air Systems",
+            hierarchy_path="QRH > Air Systems",
+            ordinal=1,
+        )
+        self.store.add_chunk(
+            version_id=qrh_version,
+            ordinal=1,
+            heading="Air Systems",
+            hierarchy_path="QRH > Air Systems",
+            content="Pack trip procedure.",
+            pdf_pages=[20],
+        )
+        self.store.create_topic(
+            topic_id="737ng-recirculation-system",
+            slug="recirculation-system",
+            title="Recirculation System",
+            aircraft="737 NG",
+            ata=["21"],
+        )
+        self.store.add_topic_aliases(
+            "737ng-recirculation-system",
+            ["Recirculation System"],
+        )
+
+        first = enrich_topics(
+            self.store,
+            document_types=("mel", "qrh"),
+        )
+        second = enrich_topics(
+            self.store,
+            document_types=("mel", "qrh"),
+        )
+        searches = self.store.connection.execute(
+            "SELECT status FROM topic_searches ORDER BY status"
+        ).fetchall()
+        evidence_count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM topic_evidence"
+        ).fetchone()[0]
+
+        self.assertEqual(
+            sorted(result.status for result in first),
+            ["found", "not_found"],
+        )
+        self.assertTrue(all(result.status == "skipped" for result in second))
+        self.assertEqual([row["status"] for row in searches], ["found", "not_found"])
+        self.assertEqual(evidence_count, 1)
+
+    def test_enrichment_refresh_preserves_reviewed_evidence(self) -> None:
+        training_version = self.register_version("chapter-training", "training")
+        section_id = self.store.add_section(
+            version_id=training_version,
+            title="Recirculation System",
+            hierarchy_path="Training > Recirculation System",
+            ordinal=1,
+        )
+        chunk_id = self.store.add_chunk(
+            version_id=training_version,
+            section_id=section_id,
+            ordinal=1,
+            heading="Recirculation System",
+            hierarchy_path="Training > Recirculation System",
+            content="The recirculation system supplies ventilation air.",
+            pdf_pages=[12],
+        )
+        self.store.create_topic(
+            topic_id="737ng-recirculation-system",
+            slug="recirculation-system",
+            title="Recirculation System",
+            aircraft="737 NG",
+            ata=["21"],
+        )
+        self.store.add_topic_aliases(
+            "737ng-recirculation-system",
+            ["Recirculation System"],
+        )
+
+        enrich_topics(
+            self.store,
+            topic_ids=("737ng-recirculation-system",),
+            document_types=("training",),
+        )
+        triage_evidence(
+            self.store,
+            topic_ids=("737ng-recirculation-system",),
+        )
+        self.store.decide_evidence_review(
+            topic_id="737ng-recirculation-system",
+            chunk_id=chunk_id,
+            evidence_role="training_support",
+            review_status="approved",
+            reviewer="test-reviewer",
+        )
+        enrich_topics(
+            self.store,
+            topic_ids=("737ng-recirculation-system",),
+            document_types=("training",),
+            max_evidence_per_document=2,
+            force=True,
+        )
+        review = self.store.connection.execute(
+            """
+            SELECT er.review_status, er.reviewer, te.review_status
+            FROM evidence_reviews er
+            JOIN topic_evidence te
+              USING(topic_id, chunk_id, evidence_role)
+            """
+        ).fetchone()
+
+        self.assertEqual(
+            tuple(review),
+            ("approved", "test-reviewer", "approved"),
+        )
+
+    def test_triages_and_preserves_manual_evidence_decisions(self) -> None:
+        mel_version = self.register_version("operator-mel", "mel")
+        section_id = self.store.add_section(
+            version_id=mel_version,
+            title="Recirculation System",
+            hierarchy_path="MEL > ATA 21 > Recirculation System",
+            ordinal=1,
+        )
+        chunk_id = self.store.add_chunk(
+            version_id=mel_version,
+            section_id=section_id,
+            ordinal=1,
+            heading="Recirculation System",
+            hierarchy_path="MEL > ATA 21 > Recirculation System",
+            content=(
+                "NO. REQUIRED FOR DISPATCH. Recirculation System may be "
+                "inoperative provided the remaining fan operates normally."
+            ),
+            pdf_pages=[12],
+            printed_pages=["PAGE NO. 21-12"],
+        )
+        self.store.create_topic(
+            topic_id="737ng-recirculation-system",
+            slug="recirculation-system",
+            title="Recirculation System",
+            aircraft="737 NG",
+            ata=["21"],
+        )
+        search_id = self.store.record_topic_search(
+            topic_id="737ng-recirculation-system",
+            version_id=mel_version,
+            search_type="mel-enrichment",
+            query_fingerprint="fingerprint",
+            status="found",
+            processor_version="test-search",
+        )
+        self.store.add_topic_evidence(
+            topic_id="737ng-recirculation-system",
+            chunk_id=chunk_id,
+            search_id=search_id,
+            evidence_role="mel_support",
+        )
+
+        triaged = triage_evidence(self.store)
+        queue = self.store.evidence_review_queue()
+        self.store.decide_evidence_review(
+            topic_id="737ng-recirculation-system",
+            chunk_id=chunk_id,
+            evidence_role="mel_support",
+            review_status="approved",
+            reviewer="test-reviewer",
+        )
+        rerun = triage_evidence(self.store)
+        review = self.store.connection.execute(
+            """
+            SELECT classification, review_status, reviewer
+            FROM evidence_reviews
+            """
+        ).fetchone()
+        evidence = self.store.connection.execute(
+            "SELECT review_status FROM topic_evidence"
+        ).fetchone()
+
+        self.assertEqual(triaged[0].classification, "procedure_candidate")
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["printed_pages_json"], '["PAGE NO. 21-12"]')
+        self.assertFalse(rerun[0].stored)
+        self.assertEqual(
+            tuple(review),
+            ("procedure_candidate", "approved", "test-reviewer"),
+        )
+        self.assertEqual(evidence["review_status"], "approved")
+
+    def test_classifies_blank_and_fcom_reference_pages(self) -> None:
+        blank = classify_evidence(
+            topic_title="Cooling",
+            document_type="qrh",
+            heading="Brake Cooling Schedule",
+            hierarchy_path="QRH > Performance",
+            content="Intentionally Blank",
+        )
+        reference = classify_evidence(
+            topic_title="Equipment Cooling System",
+            document_type="fcom",
+            heading="Equipment Cooling System",
+            hierarchy_path="FCOM > Air Systems > Equipment Cooling System",
+            content="The equipment cooling system supplies air to displays.",
+        )
+
+        self.assertEqual(blank[0], "incidental")
+        self.assertEqual(reference[0], "supporting_reference")
+
+    def test_builds_packet_from_approved_evidence_only(self) -> None:
+        training_version = self.register_version("chapter-training", "training")
+        approved_chunk = self.store.add_chunk(
+            version_id=training_version,
+            ordinal=1,
+            heading="Recirculation Fans",
+            hierarchy_path="Training > Air Systems > Recirculation Fans",
+            content="Approved recirculation system description.",
+            pdf_pages=[31],
+            printed_pages=["2.31.6"],
+        )
+        rejected_chunk = self.store.add_chunk(
+            version_id=training_version,
+            ordinal=2,
+            heading="Table Of Contents",
+            hierarchy_path="Training > Table Of Contents",
+            content="Rejected incidental recirculation system listing.",
+            pdf_pages=[2],
+        )
+        fcom_version = self.register_version("operator-fcom", "fcom")
+        excluded_fcom_chunk = self.store.add_chunk(
+            version_id=fcom_version,
+            ordinal=1,
+            heading="Recirculation Fans",
+            hierarchy_path="FCOM > Air Systems > Recirculation Fans",
+            content="Approved FCOM evidence excluded from the core profile.",
+            pdf_pages=[40],
+        )
+        self.store.create_topic(
+            topic_id="737ng-recirculation-system",
+            slug="recirculation-system",
+            title="Recirculation System",
+            aircraft="737 NG",
+            ata=["21"],
+        )
+        training_search_id = self.store.record_topic_search(
+            topic_id="737ng-recirculation-system",
+            version_id=training_version,
+            search_type="training-enrichment",
+            query_fingerprint="training-packet-fingerprint",
+            status="found",
+            processor_version="test-search",
+        )
+        for chunk_id in (approved_chunk, rejected_chunk):
+            self.store.add_topic_evidence(
+                topic_id="737ng-recirculation-system",
+                chunk_id=chunk_id,
+                search_id=training_search_id,
+                evidence_role="training_support",
+            )
+        fcom_search_id = self.store.record_topic_search(
+            topic_id="737ng-recirculation-system",
+            version_id=fcom_version,
+            search_type="fcom-enrichment",
+            query_fingerprint="fcom-packet-fingerprint",
+            status="found",
+            processor_version="test-search",
+        )
+        self.store.add_topic_evidence(
+            topic_id="737ng-recirculation-system",
+            chunk_id=excluded_fcom_chunk,
+            search_id=fcom_search_id,
+            evidence_role="fcom_support",
+        )
+        triage_evidence(self.store)
+        self.store.decide_evidence_review(
+            topic_id="737ng-recirculation-system",
+            chunk_id=approved_chunk,
+            evidence_role="training_support",
+            review_status="approved",
+            reviewer="test-reviewer",
+        )
+        self.store.decide_evidence_review(
+            topic_id="737ng-recirculation-system",
+            chunk_id=rejected_chunk,
+            evidence_role="training_support",
+            review_status="rejected",
+            reviewer="test-reviewer",
+        )
+        self.store.decide_evidence_review(
+            topic_id="737ng-recirculation-system",
+            chunk_id=excluded_fcom_chunk,
+            evidence_role="fcom_support",
+            review_status="approved",
+            reviewer="test-reviewer",
+        )
+
+        output_root = Path(self.temporary_directory.name) / "packets"
+        packet = build_research_packet(
+            self.store,
+            topic_id="737ng-recirculation-system",
+            output_root=output_root,
+        )
+        content = Path(packet.path).read_text(encoding="utf-8")
+        expanded_packet = build_research_packet(
+            self.store,
+            topic_id="737ng-recirculation-system",
+            output_root=Path(self.temporary_directory.name) / "expanded-packets",
+            source_profile="all-approved",
+        )
+        expanded_content = Path(expanded_packet.path).read_text(encoding="utf-8")
+        artifact_count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE artifact_type='research_packet'"
+        ).fetchone()[0]
+
+        self.assertEqual(packet.approved_evidence_count, 1)
+        self.assertEqual(packet.excluded_approved_evidence_count, 1)
+        self.assertEqual(packet.source_profile, "core")
+        self.assertIn("Approved recirculation system description", content)
+        self.assertNotIn("Approved FCOM evidence", content)
+        self.assertNotIn("Rejected incidental", content)
+        self.assertIn("printed 2.31.6", content)
+        self.assertEqual(expanded_packet.approved_evidence_count, 2)
+        self.assertIn("Approved FCOM evidence", expanded_content)
+        self.assertEqual(artifact_count, 2)
+
+    def test_refuses_packet_without_approved_evidence(self) -> None:
+        self.store.create_topic(
+            topic_id="737ng-empty-topic",
+            slug="empty-topic",
+            title="Empty Topic",
+            aircraft="737 NG",
+            ata=["21"],
+        )
+        with self.assertRaisesRegex(ValueError, "no approved evidence"):
+            build_research_packet(
+                self.store,
+                topic_id="737ng-empty-topic",
+                output_root=Path(self.temporary_directory.name) / "packets",
+            )
+
+    def test_builds_reviewable_okf_content_form_from_structured_claims(self) -> None:
+        training_version = self.register_version("chapter-training", "training")
+        chunk_id = self.store.add_chunk(
+            version_id=training_version,
+            ordinal=1,
+            heading="Recirculation System Introduction",
+            hierarchy_path="Training > Recirculation System > Introduction",
+            content="The system combines recirculated cabin air with pack air.",
+            pdf_pages=[12],
+            printed_pages=["Page 2"],
+        )
+        self.store.create_topic(
+            topic_id="737ng-recirculation-system",
+            slug="recirculation-system",
+            title="Recirculation System",
+            aircraft="737 NG",
+            ata=["21"],
+        )
+        search_id = self.store.record_topic_search(
+            topic_id="737ng-recirculation-system",
+            version_id=training_version,
+            search_type="training-enrichment",
+            query_fingerprint="preview-fingerprint",
+            status="found",
+            processor_version="test-search",
+        )
+        self.store.add_topic_evidence(
+            topic_id="737ng-recirculation-system",
+            chunk_id=chunk_id,
+            search_id=search_id,
+            evidence_role="training_support",
+        )
+        triage_evidence(
+            self.store,
+            topic_ids=("737ng-recirculation-system",),
+        )
+        self.store.decide_evidence_review(
+            topic_id="737ng-recirculation-system",
+            chunk_id=chunk_id,
+            evidence_role="training_support",
+            review_status="approved",
+            reviewer="test-reviewer",
+        )
+        claim_id = self.store.upsert_content_claim(
+            topic_id="737ng-recirculation-system",
+            section_key="overview",
+            claim_text=(
+                "The system combines recirculated cabin air with conditioned "
+                "air from the packs."
+            ),
+            chunk_ids=(chunk_id,),
+            sort_order=10,
+            applicability="Configuration shown in the approved Training source.",
+        )
+
+        result = build_okf_preview(
+            self.store,
+            topic_id="737ng-recirculation-system",
+            output_root=Path(self.temporary_directory.name) / "previews",
+        )
+        content = Path(result.path).read_text(encoding="utf-8")
+
+        self.assertEqual(result.claim_count, 1)
+        self.assertEqual(result.approved_claim_count, 0)
+        self.assertIn("## Overview", content)
+        self.assertIn("## Evidence map", content)
+        self.assertIn("Claim status: needs review", content)
+        self.assertIn(str(chunk_id), content)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT review_status FROM claims WHERE id = ?",
+                (claim_id,),
+            ).fetchone()[0],
+            "needs_review",
+        )
+
+        with self.assertRaisesRegex(ValueError, "must be approved"):
+            build_editorial_draft(
+                self.store,
+                topic_id="737ng-recirculation-system",
+                output_root=Path(self.temporary_directory.name) / "editorial",
+            )
+
+        approved_model = self.store.decide_latest_artifact(
+            topic_id="737ng-recirculation-system",
+            artifact_type="okf_preview",
+            review_status="approved",
+            reviewer="content-owner",
+        )
+        rebuilt_preview = build_okf_preview(
+            self.store,
+            topic_id="737ng-recirculation-system",
+            output_root=Path(self.temporary_directory.name) / "previews",
+        )
+        editorial = build_editorial_draft(
+            self.store,
+            topic_id="737ng-recirculation-system",
+            output_root=Path(self.temporary_directory.name) / "editorial",
+        )
+        editorial_content = Path(editorial.path).read_text(encoding="utf-8")
+        retained_status = self.store.connection.execute(
+            "SELECT review_status FROM artifacts WHERE id = ?",
+            (approved_model["id"],),
+        ).fetchone()[0]
+
+        self.assertEqual(rebuilt_preview.content_hash, result.content_hash)
+        self.assertEqual(retained_status, "approved")
+        self.assertEqual(editorial.content_model_hash, result.content_hash)
+        self.assertIn("editorial_status: needs_review", editorial_content)
+        self.assertIn("Training overview only", editorial_content)
+        self.assertIn("## Sources", editorial_content)
+        self.assertNotIn("Claim status:", editorial_content)
 
 
 if __name__ == "__main__":

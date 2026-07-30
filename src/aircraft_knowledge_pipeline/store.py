@@ -452,6 +452,7 @@ class KnowledgeStore:
         query: str,
         *,
         document_type: str | None = None,
+        version_id: str | None = None,
         aircraft: str | None = None,
         operator: str | None = None,
         limit: int = 20,
@@ -465,6 +466,9 @@ class KnowledgeStore:
         if document_type:
             clauses.append("d.document_type = ?")
             parameters.append(document_type.lower())
+        if version_id:
+            clauses.append("v.id = ?")
+            parameters.append(version_id)
         if aircraft:
             clauses.append(
                 """
@@ -526,6 +530,761 @@ class KnowledgeStore:
             )
             for row in rows
         ]
+
+    def candidate_rows(
+        self,
+        *,
+        candidate_ids: Sequence[str] = (),
+        status: str = "candidate",
+        minimum_confidence: float = 0.0,
+    ) -> list[sqlite3.Row]:
+        clauses = ["tc.status = ?", "COALESCE(tc.confidence, 0) >= ?"]
+        parameters: list[object] = [status, minimum_confidence]
+        if candidate_ids:
+            placeholders = ", ".join("?" for _ in candidate_ids)
+            clauses.append(f"tc.id IN ({placeholders})")
+            parameters.extend(candidate_ids)
+        return self.connection.execute(
+            f"""
+            SELECT
+                tc.id,
+                tc.version_id,
+                tc.section_id,
+                tc.title,
+                tc.hierarchy_path,
+                tc.confidence,
+                d.document_type
+            FROM topic_candidates tc
+            JOIN document_versions dv ON dv.id = tc.version_id
+            JOIN documents d ON d.id = dv.document_id
+            WHERE {" AND ".join(clauses)}
+            ORDER BY tc.hierarchy_path, tc.title
+            """,
+            parameters,
+        ).fetchall()
+
+    def accept_topic_candidate(self, candidate_id: str, topic_id: str) -> None:
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE topic_candidates
+                SET status = 'accepted', proposed_topic_id = ?
+                WHERE id = ? AND status IN ('candidate', 'accepted')
+                """,
+                (topic_id, candidate_id),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError(f"Candidate is not available for acceptance: {candidate_id}")
+
+    def canonical_topic_rows(
+        self,
+        *,
+        topic_ids: Sequence[str] = (),
+    ) -> list[sqlite3.Row]:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if topic_ids:
+            placeholders = ", ".join("?" for _ in topic_ids)
+            clauses.append(f"t.id IN ({placeholders})")
+            parameters.extend(topic_ids)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self.connection.execute(
+            f"""
+            SELECT
+                t.id,
+                t.slug,
+                t.title,
+                t.aircraft,
+                t.ata_json,
+                t.review_status
+            FROM topics t
+            {where}
+            ORDER BY t.title
+            """,
+            parameters,
+        ).fetchall()
+
+    def aliases_for_topic(self, topic_id: str) -> list[str]:
+        rows = self.connection.execute(
+            """
+            SELECT alias
+            FROM topic_aliases
+            WHERE topic_id = ?
+            ORDER BY CASE WHEN normalized_alias = (
+                SELECT normalized_alias
+                FROM topic_aliases
+                WHERE topic_id = ?
+                ORDER BY created_at, normalized_alias
+                LIMIT 1
+            ) THEN 0 ELSE 1 END, normalized_alias
+            """,
+            (topic_id, topic_id),
+        ).fetchall()
+        return [str(row["alias"]) for row in rows]
+
+    def enrichment_source_versions(
+        self,
+        *,
+        document_types: Sequence[str],
+    ) -> list[sqlite3.Row]:
+        if not document_types:
+            raise ValueError("At least one enrichment document type is required.")
+        placeholders = ", ".join("?" for _ in document_types)
+        return self.connection.execute(
+            f"""
+            SELECT
+                d.id AS document_id,
+                d.document_type,
+                dv.id AS version_id,
+                dv.checksum
+            FROM document_versions dv
+            JOIN documents d ON d.id = dv.document_id
+            WHERE d.document_type IN ({placeholders})
+              AND EXISTS (
+                  SELECT 1 FROM source_chunks c WHERE c.version_id = dv.id
+              )
+            ORDER BY d.document_type, d.id
+            """,
+            [value.lower() for value in document_types],
+        ).fetchall()
+
+    def topic_search_id(
+        self,
+        *,
+        topic_id: str,
+        version_id: str,
+        search_type: str,
+        query_fingerprint: str,
+        processor_version: str,
+    ) -> str | None:
+        row = self.connection.execute(
+            """
+            SELECT id
+            FROM topic_searches
+            WHERE topic_id = ? AND version_id = ? AND search_type = ?
+              AND query_fingerprint = ? AND processor_version = ?
+            """,
+            (
+                topic_id,
+                version_id,
+                search_type,
+                query_fingerprint,
+                processor_version,
+            ),
+        ).fetchone()
+        return str(row["id"]) if row else None
+
+    def add_topic_evidence(
+        self,
+        *,
+        topic_id: str,
+        chunk_id: str,
+        search_id: str,
+        evidence_role: str,
+        confidence: float | None = None,
+        review_status: str = "needs_review",
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO topic_evidence (
+                    topic_id, chunk_id, search_id, evidence_role,
+                    confidence, review_status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(topic_id, chunk_id, evidence_role) DO UPDATE SET
+                    search_id = excluded.search_id,
+                    confidence = excluded.confidence,
+                    review_status = CASE
+                        WHEN topic_evidence.review_status IN ('approved', 'rejected')
+                        THEN topic_evidence.review_status
+                        ELSE excluded.review_status
+                    END
+                """,
+                (
+                    topic_id,
+                    chunk_id,
+                    search_id,
+                    evidence_role,
+                    confidence,
+                    review_status,
+                    utc_now(),
+                ),
+            )
+
+    def clear_topic_evidence_for_version(
+        self,
+        *,
+        topic_id: str,
+        version_id: str,
+        evidence_role: str,
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """
+                DELETE FROM topic_evidence
+                WHERE topic_id = ? AND evidence_role = ?
+                  AND review_status = 'needs_review'
+                  AND chunk_id IN (
+                      SELECT id FROM source_chunks WHERE version_id = ?
+                  )
+                """,
+                (topic_id, evidence_role, version_id),
+            )
+
+    def evidence_rows_for_review(
+        self,
+        *,
+        topic_ids: Sequence[str] = (),
+    ) -> list[sqlite3.Row]:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if topic_ids:
+            placeholders = ", ".join("?" for _ in topic_ids)
+            clauses.append(f"te.topic_id IN ({placeholders})")
+            parameters.extend(topic_ids)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self.connection.execute(
+            f"""
+            SELECT
+                te.topic_id,
+                te.chunk_id,
+                te.evidence_role,
+                t.title AS topic_title,
+                d.document_type,
+                c.heading,
+                c.hierarchy_path,
+                c.content,
+                c.pdf_pages_json,
+                c.printed_pages_json
+            FROM topic_evidence te
+            JOIN topics t ON t.id = te.topic_id
+            JOIN source_chunks c ON c.id = te.chunk_id
+            JOIN document_versions dv ON dv.id = c.version_id
+            JOIN documents d ON d.id = dv.document_id
+            {where}
+            ORDER BY t.title, d.document_type, c.ordinal
+            """,
+            parameters,
+        ).fetchall()
+
+    def upsert_evidence_review(
+        self,
+        *,
+        topic_id: str,
+        chunk_id: str,
+        evidence_role: str,
+        classification: str,
+        score: float,
+        reasons: Sequence[str],
+        processor_version: str,
+        force: bool = False,
+    ) -> bool:
+        existing = self.connection.execute(
+            """
+            SELECT review_status, processor_version
+            FROM evidence_reviews
+            WHERE topic_id = ? AND chunk_id = ? AND evidence_role = ?
+            """,
+            (topic_id, chunk_id, evidence_role),
+        ).fetchone()
+        if (
+            existing
+            and str(existing["review_status"]) != "needs_review"
+            and not force
+        ):
+            return False
+        now = utc_now()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO evidence_reviews (
+                    topic_id, chunk_id, evidence_role, classification,
+                    score, reasons_json, processor_version, review_status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'needs_review', ?, ?)
+                ON CONFLICT(topic_id, chunk_id, evidence_role) DO UPDATE SET
+                    classification = excluded.classification,
+                    score = excluded.score,
+                    reasons_json = excluded.reasons_json,
+                    processor_version = excluded.processor_version,
+                    review_status = CASE
+                        WHEN evidence_reviews.review_status = 'needs_review'
+                          OR ? THEN 'needs_review'
+                        ELSE evidence_reviews.review_status
+                    END,
+                    reviewer = CASE WHEN ? THEN NULL ELSE evidence_reviews.reviewer END,
+                    reviewed_at = CASE WHEN ? THEN NULL ELSE evidence_reviews.reviewed_at END,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    topic_id,
+                    chunk_id,
+                    evidence_role,
+                    classification,
+                    score,
+                    json.dumps(list(reasons)),
+                    processor_version,
+                    now,
+                    now,
+                    int(force),
+                    int(force),
+                    int(force),
+                ),
+            )
+        return True
+
+    def evidence_review_queue(
+        self,
+        *,
+        classification: str | None = None,
+        review_status: str = "needs_review",
+        limit: int = 100,
+    ) -> list[sqlite3.Row]:
+        if limit < 1 or limit > 1000:
+            raise ValueError("Review queue limit must be between 1 and 1000.")
+        clauses = ["er.review_status = ?"]
+        parameters: list[object] = [review_status]
+        if classification:
+            clauses.append("er.classification = ?")
+            parameters.append(classification)
+        parameters.append(limit)
+        return self.connection.execute(
+            f"""
+            SELECT
+                er.topic_id,
+                t.title AS topic_title,
+                er.chunk_id,
+                er.evidence_role,
+                d.document_type,
+                er.classification,
+                er.score,
+                er.reasons_json,
+                er.review_status,
+                c.heading,
+                c.hierarchy_path,
+                c.pdf_pages_json,
+                c.printed_pages_json,
+                substr(c.content, 1, 500) AS excerpt
+            FROM evidence_reviews er
+            JOIN topics t ON t.id = er.topic_id
+            JOIN source_chunks c ON c.id = er.chunk_id
+            JOIN document_versions dv ON dv.id = c.version_id
+            JOIN documents d ON d.id = dv.document_id
+            WHERE {" AND ".join(clauses)}
+            ORDER BY
+                CASE er.classification
+                    WHEN 'procedure_candidate' THEN 0
+                    WHEN 'supporting_reference' THEN 1
+                    WHEN 'manual_review' THEN 2
+                    ELSE 3
+                END,
+                er.score DESC,
+                t.title,
+                c.ordinal
+            LIMIT ?
+            """,
+            parameters,
+        ).fetchall()
+
+    def decide_evidence_review(
+        self,
+        *,
+        topic_id: str,
+        chunk_id: str,
+        evidence_role: str,
+        review_status: str,
+        reviewer: str,
+    ) -> None:
+        if review_status not in {"approved", "rejected"}:
+            raise ValueError("Evidence decision must be approved or rejected.")
+        now = utc_now()
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE evidence_reviews
+                SET review_status = ?, reviewer = ?, reviewed_at = ?, updated_at = ?
+                WHERE topic_id = ? AND chunk_id = ? AND evidence_role = ?
+                """,
+                (
+                    review_status,
+                    reviewer,
+                    now,
+                    now,
+                    topic_id,
+                    chunk_id,
+                    evidence_role,
+                ),
+            )
+            if cursor.rowcount == 1:
+                self.connection.execute(
+                    """
+                    UPDATE topic_evidence
+                    SET review_status = ?
+                    WHERE topic_id = ? AND chunk_id = ? AND evidence_role = ?
+                    """,
+                    (review_status, topic_id, chunk_id, evidence_role),
+                )
+        if cursor.rowcount != 1:
+            raise ValueError("Evidence review record was not found.")
+
+    def approved_evidence_for_topic(
+        self,
+        topic_id: str,
+        *,
+        document_types: Sequence[str] = (),
+    ) -> list[sqlite3.Row]:
+        clauses = ["er.topic_id = ?", "er.review_status = 'approved'"]
+        parameters: list[object] = [topic_id]
+        if document_types:
+            placeholders = ", ".join("?" for _ in document_types)
+            clauses.append(f"d.document_type IN ({placeholders})")
+            parameters.extend(value.lower() for value in document_types)
+        return self.connection.execute(
+            f"""
+            SELECT
+                er.topic_id,
+                t.title AS topic_title,
+                t.aircraft,
+                t.ata_json,
+                er.chunk_id,
+                er.evidence_role,
+                er.classification,
+                er.score,
+                er.reviewer,
+                er.reviewed_at,
+                d.id AS document_id,
+                d.title AS document_title,
+                d.file_name,
+                d.document_type,
+                dv.id AS version_id,
+                c.heading,
+                c.hierarchy_path,
+                c.content,
+                c.pdf_pages_json,
+                c.printed_pages_json
+            FROM evidence_reviews er
+            JOIN topics t ON t.id = er.topic_id
+            JOIN source_chunks c ON c.id = er.chunk_id
+            JOIN document_versions dv ON dv.id = c.version_id
+            JOIN documents d ON d.id = dv.document_id
+            WHERE {" AND ".join(clauses)}
+            ORDER BY
+                CASE d.document_type
+                    WHEN 'training' THEN 0
+                    WHEN 'fcom' THEN 1
+                    WHEN 'amm' THEN 2
+                    WHEN 'mel' THEN 3
+                    WHEN 'qrh' THEN 4
+                    ELSE 5
+                END,
+                c.ordinal,
+                c.id
+            """,
+            parameters,
+        ).fetchall()
+
+    def upsert_content_claim(
+        self,
+        *,
+        topic_id: str,
+        section_key: str,
+        claim_text: str,
+        chunk_ids: Sequence[str],
+        sort_order: int = 0,
+        applicability: str | None = None,
+        claim_id: str | None = None,
+    ) -> str:
+        allowed_sections = {
+            "overview",
+            "system_flow",
+            "components",
+            "control_logic",
+            "maintenance_context",
+            "applicability",
+        }
+        if section_key not in allowed_sections:
+            raise ValueError(f"Unknown content claim section: {section_key}")
+        claim_text = " ".join(claim_text.split())
+        if not claim_text:
+            raise ValueError("Claim text cannot be blank.")
+        if not chunk_ids:
+            raise ValueError("A content claim requires at least one evidence chunk.")
+        unique_chunk_ids = tuple(dict.fromkeys(chunk_ids))
+        placeholders = ", ".join("?" for _ in unique_chunk_ids)
+        approved_rows = self.connection.execute(
+            f"""
+            SELECT DISTINCT er.chunk_id
+            FROM evidence_reviews er
+            JOIN source_chunks c ON c.id = er.chunk_id
+            JOIN document_versions dv ON dv.id = c.version_id
+            JOIN documents d ON d.id = dv.document_id
+            WHERE er.topic_id = ?
+              AND er.review_status = 'approved'
+              AND d.document_type IN ('training', 'amm')
+              AND er.chunk_id IN ({placeholders})
+            """,
+            (topic_id, *unique_chunk_ids),
+        ).fetchall()
+        approved_chunk_ids = {str(row["chunk_id"]) for row in approved_rows}
+        missing = sorted(set(unique_chunk_ids) - approved_chunk_ids)
+        if missing:
+            raise ValueError(
+                "Claims may use only approved Training/AMM evidence for the topic. "
+                "Unapproved chunk IDs: "
+                + ", ".join(missing)
+            )
+        claim_id = claim_id or str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"akp:claim:{topic_id}:{section_key}:{claim_text}",
+            )
+        )
+        now = utc_now()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO claims (
+                    id, topic_id, claim_text, review_status, created_at, updated_at
+                ) VALUES (?, ?, ?, 'needs_review', ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    topic_id = excluded.topic_id,
+                    claim_text = excluded.claim_text,
+                    updated_at = excluded.updated_at
+                """,
+                (claim_id, topic_id, claim_text, now, now),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO claim_metadata (
+                    claim_id, section_key, sort_order, applicability
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(claim_id) DO UPDATE SET
+                    section_key = excluded.section_key,
+                    sort_order = excluded.sort_order,
+                    applicability = excluded.applicability
+                """,
+                (claim_id, section_key, sort_order, applicability),
+            )
+            self.connection.execute(
+                "DELETE FROM claim_evidence WHERE claim_id = ?",
+                (claim_id,),
+            )
+            self.connection.executemany(
+                """
+                INSERT INTO claim_evidence (
+                    claim_id, chunk_id, created_at
+                ) VALUES (?, ?, ?)
+                """,
+                [(claim_id, chunk_id, now) for chunk_id in unique_chunk_ids],
+            )
+        return claim_id
+
+    def decide_content_claim(
+        self,
+        *,
+        claim_id: str,
+        review_status: str,
+        reviewer: str,
+    ) -> None:
+        if review_status not in {"approved", "rejected"}:
+            raise ValueError("Claim decision must be approved or rejected.")
+        now = utc_now()
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE claims
+                SET review_status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (review_status, now, claim_id),
+            )
+            if cursor.rowcount == 1:
+                self.connection.execute(
+                    """
+                    UPDATE claim_metadata
+                    SET reviewer = ?, reviewed_at = ?
+                    WHERE claim_id = ?
+                    """,
+                    (reviewer, now, claim_id),
+                )
+        if cursor.rowcount != 1:
+            raise ValueError(f"Content claim was not found: {claim_id}")
+
+    def content_claim_rows(self, topic_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """
+            SELECT
+                c.id AS claim_id,
+                c.claim_text,
+                c.review_status,
+                cm.section_key,
+                cm.sort_order,
+                cm.applicability,
+                cm.reviewer,
+                cm.reviewed_at,
+                ce.chunk_id,
+                d.document_type,
+                d.title AS document_title,
+                d.file_name,
+                sc.heading,
+                sc.pdf_pages_json,
+                sc.printed_pages_json
+            FROM claims c
+            JOIN claim_metadata cm ON cm.claim_id = c.id
+            JOIN claim_evidence ce ON ce.claim_id = c.id
+            JOIN source_chunks sc ON sc.id = ce.chunk_id
+            JOIN document_versions dv ON dv.id = sc.version_id
+            JOIN documents d ON d.id = dv.document_id
+            WHERE c.topic_id = ?
+            ORDER BY
+                CASE cm.section_key
+                    WHEN 'overview' THEN 0
+                    WHEN 'system_flow' THEN 1
+                    WHEN 'components' THEN 2
+                    WHEN 'control_logic' THEN 3
+                    WHEN 'maintenance_context' THEN 4
+                    WHEN 'applicability' THEN 5
+                    ELSE 6
+                END,
+                cm.sort_order,
+                c.id,
+                d.document_type,
+                sc.ordinal
+            """,
+            (topic_id,),
+        ).fetchall()
+
+    def evidence_review_summary(self, topic_id: str) -> dict[str, int]:
+        rows = self.connection.execute(
+            """
+            SELECT review_status, COUNT(*) AS count
+            FROM evidence_reviews
+            WHERE topic_id = ?
+            GROUP BY review_status
+            """,
+            (topic_id,),
+        ).fetchall()
+        return {str(row["review_status"]): int(row["count"]) for row in rows}
+
+    def record_artifact(
+        self,
+        *,
+        artifact_id: str,
+        topic_id: str,
+        artifact_type: str,
+        artifact_path: str,
+        content_hash: str,
+        schema_version: str,
+        review_status: str = "needs_review",
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """
+                DELETE FROM artifacts
+                WHERE topic_id = ? AND artifact_type = ? AND artifact_path = ?
+                  AND content_hash <> ?
+                """,
+                (topic_id, artifact_type, artifact_path, content_hash),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO artifacts (
+                    id, topic_id, artifact_type, artifact_path, content_hash,
+                    schema_version, review_status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(artifact_type, artifact_path, content_hash) DO UPDATE SET
+                    topic_id = excluded.topic_id,
+                    schema_version = excluded.schema_version,
+                    review_status = CASE
+                        WHEN artifacts.review_status IN ('approved', 'rejected')
+                        THEN artifacts.review_status
+                        ELSE excluded.review_status
+                    END
+                """,
+                (
+                    artifact_id,
+                    topic_id,
+                    artifact_type,
+                    artifact_path,
+                    content_hash,
+                    schema_version,
+                    review_status,
+                    utc_now(),
+                ),
+            )
+
+    def decide_latest_artifact(
+        self,
+        *,
+        topic_id: str,
+        artifact_type: str,
+        review_status: str,
+        reviewer: str,
+    ) -> sqlite3.Row:
+        if review_status not in {"approved", "rejected"}:
+            raise ValueError("Artifact decision must be approved or rejected.")
+        artifact = self.connection.execute(
+            """
+            SELECT *
+            FROM artifacts
+            WHERE topic_id = ? AND artifact_type = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (topic_id, artifact_type),
+        ).fetchone()
+        if not artifact:
+            raise ValueError(
+                f"No {artifact_type} artifact exists for topic: {topic_id}"
+            )
+        now = utc_now()
+        with self.connection:
+            self.connection.execute(
+                "UPDATE artifacts SET review_status = ? WHERE id = ?",
+                (review_status, artifact["id"]),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO artifact_reviews (
+                    artifact_id, review_status, reviewer, reviewed_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(artifact_id) DO UPDATE SET
+                    review_status = excluded.review_status,
+                    reviewer = excluded.reviewer,
+                    reviewed_at = excluded.reviewed_at
+                """,
+                (artifact["id"], review_status, reviewer, now),
+            )
+        return self.connection.execute(
+            """
+            SELECT a.*, ar.reviewer, ar.reviewed_at
+            FROM artifacts a
+            JOIN artifact_reviews ar ON ar.artifact_id = a.id
+            WHERE a.id = ?
+            """,
+            (artifact["id"],),
+        ).fetchone()
+
+    def approved_artifact(
+        self,
+        *,
+        topic_id: str,
+        artifact_type: str,
+    ) -> sqlite3.Row | None:
+        return self.connection.execute(
+            """
+            SELECT a.*, ar.reviewer, ar.reviewed_at
+            FROM artifacts a
+            JOIN artifact_reviews ar ON ar.artifact_id = a.id
+            WHERE a.topic_id = ?
+              AND a.artifact_type = ?
+              AND a.review_status = 'approved'
+              AND ar.review_status = 'approved'
+            ORDER BY a.created_at DESC, a.id DESC
+            LIMIT 1
+            """,
+            (topic_id, artifact_type),
+        ).fetchone()
 
     def record_topic_search(
         self,
@@ -798,6 +1557,8 @@ class KnowledgeStore:
             ("topic_candidates", "topic_candidates"),
             ("topics", "topics"),
             ("searches", "topic_searches"),
+            ("evidence", "topic_evidence"),
+            ("evidence_reviews", "evidence_reviews"),
             ("claims", "claims"),
             ("jobs", "processing_jobs"),
             ("artifacts", "artifacts"),

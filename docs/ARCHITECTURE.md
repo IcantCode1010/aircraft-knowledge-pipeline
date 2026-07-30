@@ -26,8 +26,11 @@ Register document
   -> search optional supporting sources
   -> collect evidence
   -> create research packet
-  -> assemble OKF draft
-  -> review
+  -> draft evidence-linked claims
+  -> assemble OKF content preview
+  -> approve content form
+  -> assemble editorial draft
+  -> approve reader-facing copy
   -> publish
 ```
 
@@ -212,7 +215,46 @@ The first topic-candidate implementation uses explicit training-manual
 `Subject <ATA> - <title>` hierarchy nodes. This produces a small review queue
 before canonical topic creation. The rule, command, input/output tables, and
 processor-version requirements are maintained in `FILE_INSTRUCTION_MAP.md`.
-6. OKF article assembler and validator
+
+Accepted candidates become stable aircraft-scoped topics with exact aliases and
+ATA metadata. Enrichment then searches each selected supporting document
+version independently. It stores `found` and `not_found` outcomes, and attaches
+only the bounded best exact-text matches as reviewable evidence.
+
+Retrieved evidence passes through a separate triage table. Deterministic rules
+classify likely procedures, supporting references, incidental matches, and
+ambiguous results while retaining reasons and a score. These are queue hints,
+not publication decisions: only an explicit reviewer action changes evidence
+from `needs_review` to `approved` or `rejected`.
+
+The research-packet exporter reads only approved review records and fails when a
+topic has none. Its private Markdown output is an auditable evidence inventory
+with page provenance and bounded excerpts.
+
+Structured claims are the next trust boundary. Each claim belongs to a stable
+content section and must cite one or more approved Training or AMM chunks. The
+OKF preview exporter renders those claims into a human-reviewable Markdown
+article with an evidence map. It is explicitly not a public or operational
+artifact. Content and structure approval must happen before TypeScript work.
+
+Content-model approval is bound to the exact preview artifact hash. The
+editorial exporter refuses to run without that approval, then removes internal
+claim-state markers and produces reader-facing Markdown with source footnotes.
+The resulting editorial artifact has its own `needs_review` state and must be
+approved separately before presentation-layer implementation.
+
+Maintenance content is intentionally bounded between two failure modes. It
+should explain what access, preparation, checks, and restoration are broadly
+involved for training context, while excluding executable step sequences,
+switch tables, limits, and other details that could be mistaken for approved
+maintenance instructions.
+
+The condensed source policy makes Training and AMM the core topic inputs.
+MEL and QRH are optional, topic-specific enrichments and do not enter the core
+packet. FCOM is excluded by default to avoid duplicating Training material, but
+can be requested explicitly for audits or coverage gaps. Retrieved evidence is
+preserved even when the active packet profile excludes it.
+6. Approved-content OKF article assembler and validator
 7. Revision impact analysis
 
 ## Implemented PDF extraction
